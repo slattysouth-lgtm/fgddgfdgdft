@@ -1,3 +1,10 @@
+=======================================================
+  COPIE VISIBLE DU WORKFLOW
+  A coller dans le fichier :  .github/workflows/build-voice.yml
+  (ne PAS renommer, ne PAS modifier l'indentation)
+  Seule ligne a changer : NTFY_TOPIC
+========================================================
+
 # =============================================================================
 #  UNCERTAIN VOICE — build.yml
 #  Chemin : .github/workflows/build-voice.yml
