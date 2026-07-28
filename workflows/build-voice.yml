@@ -1,0 +1,151 @@
+# =============================================================================
+#  UNCERTAIN VOICE — build.yml
+#  Chemin : .github/workflows/build-voice.yml
+#
+#  1 push -> build payant + free -> installeurs -> Release (lien permanent)
+#            -> notification téléphone (succès OU échec)
+#
+#  ⚠ Corrige les 2 bugs de blank.yml :
+#     - le CMakeLists est dans un SOUS-DOSSIER (pas à la racine)
+#     - installer.iss exige des /D... que blank.yml ne passait pas
+# =============================================================================
+
+name: Build Uncertain Voice
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - 'UncertainVoice-v1/**'
+      - '.github/workflows/build-voice.yml'
+  workflow_dispatch:
+
+# ── seule ligne à personnaliser : mets un nom de topic NON DEVINABLE ────────
+env:
+  PLUGIN_DIR: UncertainVoice-v1
+  NTFY_TOPIC: uncertain-builds-METS-UN-NOM-SECRET
+# ───────────────────────────────────────────────────────────────────────────
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: paid
+            trial: "OFF"
+            appname: "Uncertain Voice"
+          - edition: free
+            trial: "ON"
+            appname: "Uncertain Voice Free"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Cache des sources JUCE (FetchContent) -> builds suivants bien plus rapides
+      - name: Cache JUCE
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PLUGIN_DIR }}/build/_deps
+          key: juce-${{ runner.os }}-${{ hashFiles(format('{0}/CMakeLists.txt', env.PLUGIN_DIR)) }}
+
+      # PAS de -G codé en dur (casse sur runners à jour) — -A x64 explicite
+      - name: Configure CMake
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: cmake -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DUV_TRIAL=${{ matrix.trial }}
+
+      - name: Build Release
+        working-directory: ${{ env.PLUGIN_DIR }}
+        run: cmake --build build --config Release --parallel
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer (${{ matrix.edition }})
+        working-directory: ${{ env.PLUGIN_DIR }}
+        shell: pwsh
+        run: |
+          # localise le bundle .vst3 produit par JUCE
+          $vst3 = Get-ChildItem -Path build -Recurse -Directory -Filter "*.vst3" |
+                  Select-Object -First 1
+          if (-not $vst3) { throw "Aucun .vst3 trouve dans build/" }
+          Write-Host "VST3 trouve : $($vst3.FullName)"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & $iscc `
+            "/DAppName=${{ matrix.appname }}" `
+            "/DAppVersion=0.1.0" `
+            "/DSrcDir=$($vst3.FullName)" `
+            "/DOutName=UncertainVoice-${{ matrix.edition }}-Setup" `
+            "/DOutDir=dist" `
+            installer.iss
+
+      # Règle habituelle : les logs partent MÊME en cas d'échec
+      - name: Upload BUILD-LOGS
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: BUILD-LOGS-${{ matrix.edition }}
+          path: |
+            ${{ env.PLUGIN_DIR }}/build/**/*.log
+            ${{ env.PLUGIN_DIR }}/build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+
+      - name: Upload installer
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.edition }}
+          path: ${{ env.PLUGIN_DIR }}/dist/*.exe
+          if-no-files-found: error
+
+  # Une seule Release qui reçoit les deux installeurs (évite la collision)
+  release:
+    needs: build
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          merge-multiple: true
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: voice-${{ github.run_number }}
+          name: "Uncertain Voice — build ${{ github.run_number }}"
+          files: dist/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    needs: [build, release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping téléphone (ntfy)
+        run: |
+          if [ "${{ needs.build.result }}" = "success" ] && [ "${{ needs.release.result }}" = "success" ]; then
+            TITLE="Uncertain Voice — build ${{ github.run_number }} pret"
+            BODY="Payant + free publies. Tape pour telecharger."
+            LINK="${{ github.server_url }}/${{ github.repository }}/releases/latest"
+            PRIO="default"
+          else
+            TITLE="Uncertain Voice — build ${{ github.run_number }} ECHOUE"
+            BODY="Build casse. Tape pour voir les logs."
+            LINK="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            PRIO="high"
+          fi
+          curl -s \
+            -H "Title: $TITLE" \
+            -H "Click: $LINK" \
+            -H "Priority: $PRIO" \
+            -d "$BODY" \
+            "https://ntfy.sh/${{ env.NTFY_TOPIC }}"
